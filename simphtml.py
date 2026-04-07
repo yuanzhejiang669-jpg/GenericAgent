@@ -291,10 +291,10 @@ function analyzeNode(node, pPathType='main') {
 const _fc = [...domCopy.querySelectorAll('*')].filter(el => {
   if (el.parentNode === domCopy) return false;
   const info = getNodeInfo(el);
-  if (!info?.rect || (info.style.position !== 'fixed' && info.style.position !== 'sticky')) return false;
+  if (!info?.rect || info.style.position !== 'fixed') return false;
   const r = info.rect, cover = (r.width * r.height) / viewportArea;
   const cd = Math.abs((r.left + r.width/2) - window.innerWidth/2) / window.innerWidth;
-  return cover > 0.15 && cd < 0.3 && el.querySelector('button, input, a, [role="button"], iframe');
+  return cover > 0.15 && cover < 1.0 && cd < 0.3 && el.querySelector('button, input, a, [role="button"], iframe');
 }).filter((el, _, arr) => !arr.some(o => o !== el && o.contains(el)))
   .sort((a, b) => (getNodeInfo(b).rect.width * getNodeInfo(b).rect.height) - (getNodeInfo(a).rect.width * getNodeInfo(a).rect.height))
   .slice(0, 2);
