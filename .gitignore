@@ -76,6 +76,11 @@ memory/L4_raw_sessions/*
 # Keychain
 !memory/keychain.py
 
+# Vision / OCR / UI detection tools
+!memory/ocr_utils.py
+!memory/vision_sop.md
+!memory/ui_detect.py
+
 # Visual Studio
 .vs/
 restore_commit.txt
