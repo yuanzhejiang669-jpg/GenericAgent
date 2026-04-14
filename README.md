@@ -179,7 +179,11 @@ You're also welcome to join our **GenericAgent Community Group** for discussion,
 <img src="assets/images/wechat_group.jpg" width="280"/>
 </div>
 
+## 🚩 Friendly Links
 
+Thanks for the support from the LinuxDo community!
+
+[![LinuxDo](https://img.shields.io/badge/社区-LinuxDo-blue?style=for-the-badge)](https://linux.do/)
 
 ## 📄 License
 
