@@ -526,6 +526,7 @@ class NativeClaudeSession(BaseSession):
         super().__init__(cfg)
         self.context_win = cfg.get("context_win", 28000)
         self.fake_cc_system_prompt = cfg.get("fake_cc_system_prompt", False)
+        self.user_agent = cfg.get("user_agent", "claude-cli/2.1.113 (external, cli)")
         self._session_id = str(uuid.uuid4())
         self._account_uuid = str(uuid.uuid4())
         self._device_id = uuid.uuid4().hex + uuid.uuid4().hex[:32]
@@ -538,7 +539,7 @@ class NativeClaudeSession(BaseSession):
             beta_parts.insert(1, "context-1m-2025-08-07"); model = model.replace("[1m]", "").replace("[1M]", "")
         headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01",
             "anthropic-beta": ",".join(beta_parts), "anthropic-dangerous-direct-browser-access": "true",
-            "user-agent": "claude-cli/2.1.114 (external, cli)", "x-app": "cli"}
+            "user-agent": self.user_agent, "x-app": "cli"}
         if self.api_key.startswith("sk-ant-"): headers["x-api-key"] = self.api_key
         else: headers["authorization"] = f"Bearer {self.api_key}"
         payload = {"model": model, "messages": messages, "max_tokens": self.max_tokens, "stream": self.stream}
