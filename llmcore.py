@@ -1,7 +1,7 @@
 import os, json, re, time, requests, sys, threading, urllib3, base64, mimetypes, uuid
 from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-_RESP_CACHE_KEY = str(uuid.uuid4()) 
+_RESP_CACHE_KEY = str(uuid.uuid4())
 
 def _load_mykeys():
     try:
@@ -157,6 +157,22 @@ def _parse_claude_sse(resp_lines):
         content_blocks.append({"type": "text", "text": warn}); yield warn
     return content_blocks
 
+
+def _try_parse_tool_args(raw):
+    """Parse tool args string; split concatenated JSON objects like {..}{..} if needed.
+    Returns list of parsed dicts."""
+    if not raw: return [{}]
+    try: return [json.loads(raw)]
+    except: pass
+    parts = re.split(r'(?<=\})(?=\{)', raw)
+    if len(parts) > 1:
+        parsed = []
+        for p in parts:
+            try: parsed.append(json.loads(p))
+            except: return [{"_raw": raw}]
+        return parsed
+    return [{"_raw": raw}]
+
 def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
     """Parse OpenAI SSE stream (chat_completions or responses API).
     Yields text chunks, returns list[content_block].
@@ -205,9 +221,11 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
         if content_text: blocks.append({"type": "text", "text": content_text})
         for idx in sorted(fc_buf):
             fc = fc_buf[idx]
-            try: inp = json.loads(fc["args"]) if fc["args"] else {}
-            except: inp = {"_raw": fc["args"]}
-            blocks.append({"type": "tool_use", "id": fc["id"], "name": fc["name"], "input": inp})
+            inps = _try_parse_tool_args(fc["args"])
+            for i, inp in enumerate(inps):
+                bid = fc["id"] or ''
+                if len(inps) > 1: bid = f"{bid}_{i}" if bid else f"split_{i}"
+                blocks.append({"type": "tool_use", "id": bid, "name": fc["name"], "input": inp})
         return blocks
     else:
         tc_buf = {}  # index -> {id, name, args}
@@ -225,7 +243,7 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
                 text = delta["content"]; content_text += text; yield text
             for tc in (delta.get("tool_calls") or []):
                 idx = tc.get("index", 0)
-                if idx not in tc_buf: tc_buf[idx] = {"id": tc.get("id", ""), "name": "", "args": ""}
+                if idx not in tc_buf: tc_buf[idx] = {"id": tc.get("id") or '', "name": "", "args": ""}
                 if tc.get("function", {}).get("name"): tc_buf[idx]["name"] = tc["function"]["name"]
                 if tc.get("function", {}).get("arguments"): tc_buf[idx]["args"] += tc["function"]["arguments"]
             usage = evt.get("usage")
@@ -234,9 +252,11 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
         if content_text: blocks.append({"type": "text", "text": content_text})
         for idx in sorted(tc_buf):
             tc = tc_buf[idx]
-            try: inp = json.loads(tc["args"]) if tc["args"] else {}
-            except: inp = {"_raw": tc["args"]}
-            blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": inp})
+            inps = _try_parse_tool_args(tc["args"])
+            for i, inp in enumerate(inps):
+                bid = tc["id"] or ''
+                if len(inps) > 1: bid = f"{bid}_{i}" if bid else f"split_{i}"
+                blocks.append({"type": "tool_use", "id": bid, "name": tc["name"], "input": inp})
         return blocks
 
 def _record_usage(usage, api_mode):
@@ -333,7 +353,7 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
                     body = ""
                     try: body = r.text.strip()[:500]
                     except: pass
-                    err = f"Error: HTTP {r.status_code}" + (f": {body}" if body else "")
+                    err = f"!!!Error: HTTP {r.status_code}" + (f": {body}" if body else "")
                     yield err; return [{"type": "text", "text": err}]
                 gen = _parse_openai_sse(r.iter_lines(), api_mode) if stream else _parse_openai_json(r.json(), api_mode)
                 try:
@@ -345,10 +365,10 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
                 d = _delay(None, attempt)
                 print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{max_retries+1})")
                 time.sleep(d); continue
-            err = f"Error: {type(e).__name__}"
+            err = f"!!!Error: {type(e).__name__}"
             yield err; return [{"type": "text", "text": err}]
         except Exception as e:
-            err = f"Error: {type(e).__name__}: {e}"
+            err = f"!!!Error: {type(e).__name__}: {e}"
             yield err; return [{"type": "text", "text": err}]
         
 def _prepare_oai_tools(tools, api_mode="chat_completions"):
@@ -386,11 +406,11 @@ def _to_responses_input(messages):
                 elif ptype == "image_url":
                     url = (part.get("image_url") or {}).get("url", "")
                     if url and role != "assistant": parts.append({"type": "input_image", "image_url": url})
-        if len(parts) == 0: parts = [{"type": text_type, "text": str(content)}]
+        if len(parts) == 0: parts = [{"type": text_type, "text": str(content) or '[empty]'}]
         result.append({"role": role, "content": parts})
         for tc in (msg.get("tool_calls") or []):
             f = tc.get("function", {})
-            result.append({"type": "function_call", "call_id": tc.get("id", ""), "name": f.get("name", ""), "arguments": f.get("arguments", "")})
+            result.append({"type": "function_call", "call_id": tc.get("id") or '', "name": f.get("name", ""), "arguments": f.get("arguments", "")})
     return result
 
 
@@ -404,10 +424,10 @@ def _msgs_claude2oai(messages):
             text_parts, tool_calls = [], []
             for b in blocks:
                 if not isinstance(b, dict): continue
-                if b.get("type") == "text": text_parts.append({"type": "text", "text": b.get("text", "")})
+                if b.get("type") == "text" and b.get("text"): text_parts.append({"type": "text", "text": b.get("text", "")})
                 elif b.get("type") == "tool_use":
                     tool_calls.append({
-                        "id": b.get("id", ""), "type": "function",
+                        "id": b.get("id") or '', "type": "function",
                         "function": {"name": b.get("name", ""), "arguments": json.dumps(b.get("input", {}), ensure_ascii=False)}
                     })
             m = {"role": "assistant"}
@@ -426,13 +446,13 @@ def _msgs_claude2oai(messages):
                     tr = b.get("content", "")
                     if isinstance(tr, list):
                         tr = "\n".join(x.get("text", "") for x in tr if isinstance(x, dict) and x.get("type") == "text")
-                    result.append({"role": "tool", "tool_call_id": b.get("tool_use_id", ""), "content": tr if isinstance(tr, str) else str(tr)})
+                    result.append({"role": "tool", "tool_call_id": b.get("tool_use_id") or '', "content": tr if isinstance(tr, str) else str(tr)})
                 elif b.get("type") == "image":
                     src = b.get("source") or {}
                     if src.get("type") == "base64" and src.get("data"):
                         text_parts.append({"type": "image_url", "image_url": {"url": f"data:{src.get('media_type', 'image/png')};base64,{src.get('data', '')}"}})
                 elif b.get("type") == "image_url": text_parts.append(b)
-                elif b.get("type") == "text": text_parts.append({"type": "text", "text": b.get("text", "")})
+                elif b.get("type") == "text" and b.get("text"): text_parts.append({"type": "text", "text": b.get("text", "")})
             if text_parts: result.append({"role": "user", "content": text_parts})
         else: result.append(msg)
     return result
@@ -895,6 +915,7 @@ THINKING_PROMPT_ZH = """
 每次回复请先在回复文字中包含：
 1. 在 <thinking></thinking> 标签中先分析现状和策略
 2. 在 <summary></summary> 中输出极简单行（<30字）物理快照：上次结果新信息+本次意图。此内容进入长期工作记忆。
+再进行回答。
 \n**除了最后回答，必须进行工具调用！**
 """.strip()
 THINKING_PROMPT_EN = """
@@ -902,6 +923,7 @@ THINKING_PROMPT_EN = """
 The reply body should first include:
 1. Analyze the current situation and strategy inside <thinking></thinking>
 2. Output a minimal one-line (<30 words) physical snapshot in <summary></summary>: new info from last result + current intent. This goes into long-term working memory.
+Then reply.
 \n**Tool calls are required for every turn except the final answer!**
 """.strip()
 

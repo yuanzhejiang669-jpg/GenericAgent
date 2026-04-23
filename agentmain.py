@@ -75,7 +75,8 @@ class GeneraticAgent:
         self.llm_no = ((self.llm_no + 1) if n < 0 else n) % len(self.llmclients)
         lastc = self.llmclient
         self.llmclient = self.llmclients[self.llm_no]
-        self.llmclient.backend.history = lastc.backend.history
+        try: self.llmclient.backend.history = lastc.backend.history
+        except: raise Exception('[ERROR] BAD Mixin config: Check your mykey.py')
         self.llmclient.last_tools = ''
         name = self.get_llm_name(model=True)
         if 'glm' in name or 'minimax' in name or 'kimi' in name: load_tool_schema('_cn')

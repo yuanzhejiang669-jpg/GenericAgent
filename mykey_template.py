@@ -263,6 +263,19 @@ mixin_config = {
 #     # 'fake_cc_system_prompt': False,              # MiniMax 不做 CC 指纹校验
 # }
 
+# ── 1g. Kimi for Coding (Anthropic 兼容 CC 透传端点) ──────────────────────
+#  Kimi 官方为 Claude Code / Codex 开放的 /coding 路径，走 Anthropic 协议。
+#  与 4b 的 Moonshot OAI 路径是两回事：model 用 'kimi-for-coding'（非 kimi-k2）。
+#  官方硬要求透传 CC system prompt → fake_cc_system_prompt=True 必填。
+#  文档: https://www.kimi.com/code/docs/third-party-tools/other-coding-agents.html
+# native_claude_config_kimi = {
+#     'name': 'kimi-coding',                   # /llms 显示名 & mixin 引用名
+#     'apikey': 'sk-kimi-<your-kimi-coding-key>',  # Bearer 鉴权
+#     'apibase': 'https://api.kimi.com/coding',# Anthropic 兼容端点
+#     'model': 'kimi-for-coding',              # 官方 coding 专用 model id
+#     'fake_cc_system_prompt': True,           # 必填；官方硬要求透传 CC 系统串
+#     'thinking_type': 'adaptive',             # 'adaptive'/'enabled'/'disabled'
+# }
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  2. NativeOAISession — OpenAI 协议 + 原生工具
