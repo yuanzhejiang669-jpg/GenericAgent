@@ -417,7 +417,7 @@ class GenericAgentHandler(BaseHandler):
     def _in_plan_mode(self): return self.working.get('in_plan_mode')
     def _exit_plan_mode(self): self.working.pop('in_plan_mode', None)
     def enter_plan_mode(self, plan_path): 
-        self.working['in_plan_mode'] = plan_path; self.max_turns = 80
+        self.working['in_plan_mode'] = plan_path; self.max_turns = 100
         print(f"[Info] Entered plan mode with plan file: {plan_path}"); return plan_path
     def _check_plan_completion(self):
         if not os.path.isfile(p:=self._in_plan_mode() or ''): return None
@@ -525,7 +525,7 @@ class GenericAgentHandler(BaseHandler):
             next_prompt += "\n[DANGER] 上一轮遗漏了<summary>，需要按协议在<summary>中输出极简单行摘要！" 
         summary = smart_format(summary, max_str_len=100)
         self.history_info.append(f'[Agent] {summary}')
-        if turn % 35 == 0 and 'plan' not in str(self.working.get('related_sop')):
+        if turn % 65 == 0 and 'plan' not in str(self.working.get('related_sop')):
             next_prompt += f"\n\n[DANGER] 已连续执行第 {turn} 轮。你必须总结情况进行ask_user，不允许继续重试。"
         elif turn % 7 == 0:
             next_prompt += f"\n\n[DANGER] 已连续执行第 {turn} 轮。禁止无效重试。若无有效进展，必须切换策略：1. 探测物理边界 2. 请求用户协助。如有需要，可调用 update_working_checkpoint 保存关键上下文。"
@@ -533,7 +533,7 @@ class GenericAgentHandler(BaseHandler):
 
         if (_plan := self._in_plan_mode()) and turn >= 10 and turn % 5 == 0:
             next_prompt = f"[Plan Hint] 你正在计划模式。必须 file_read({_plan}) 确认当前步骤，回复开头引用：📌 当前步骤：...\n\n" + next_prompt
-        if _plan and turn >= 70: next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
+        if _plan and turn >= 90: next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
 
         injkeyinfo = consume_file(self.parent.task_dir, '_keyinfo')
         injprompt = consume_file(self.parent.task_dir, '_intervene')

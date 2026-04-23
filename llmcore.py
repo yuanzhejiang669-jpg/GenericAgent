@@ -314,9 +314,8 @@ def _stamp_oai_cache_markers(messages, model):
             messages[idx] = {**messages[idx], 'content': c}
 
 def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completions', *,
-                   temperature=0.5, max_tokens=None, tools=None, reasoning_effort=None,
-                   max_retries=0, connect_timeout=10, read_timeout=300, proxies=None,
-                   stream=True):
+                   system=None, temperature=0.5, max_tokens=None, tools=None, reasoning_effort=None,
+                   max_retries=0, connect_timeout=10, read_timeout=300, proxies=None, stream=True):
     """Shared OpenAI-compatible streaming request with retry. Yields text chunks, returns list[content_block]."""
     ml = model.lower()
     if 'kimi' in ml or 'moonshot' in ml: temperature = 1
@@ -324,10 +323,12 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"}
     if api_mode == "responses":
         url = auto_make_url(api_base, "responses")
-        payload = {"model": model, "input": _to_responses_input(messages), "stream": stream, "prompt_cache_key": _RESP_CACHE_KEY}
+        payload = {"model": model, "input": _to_responses_input(messages), "stream": stream, 
+                   "prompt_cache_key": _RESP_CACHE_KEY, "instructions": system or "You are an Omnipotent Executor."}
         if reasoning_effort: payload["reasoning"] = {"effort": reasoning_effort}
     else:
         url = auto_make_url(api_base, "chat/completions")
+        if system: messages = [{"role": "system", "content": system}] + messages
         _stamp_oai_cache_markers(messages, model)
         payload = {"model": model, "messages": messages, "stream": stream}
         if stream: payload["stream_options"] = {"include_usage": True}
@@ -383,11 +384,12 @@ def _prepare_oai_tools(tools, api_mode="chat_completions"):
     return tools
 
 def _to_responses_input(messages):
-    result = []
+    result, pending = [], []
     for msg in messages:
         role = str(msg.get("role", "user")).lower()
         if role == "tool":
-            result.append({"type": "function_call_output", "call_id": msg.get("tool_call_id", ""), "output": msg.get("content", "")})
+            cid = msg.get("tool_call_id") or (pending.pop(0) if pending else f"call_{uuid.uuid4().hex[:8]}")
+            result.append({"type": "function_call_output", "call_id": cid, "output": msg.get("content", "")})
             continue
         if role not in ["user", "assistant", "system", "developer"]: role = "user"
         if role == "system": role = "developer"  # Responses API uses 'developer' instead of 'system'
@@ -408,9 +410,12 @@ def _to_responses_input(messages):
                     if url and role != "assistant": parts.append({"type": "input_image", "image_url": url})
         if len(parts) == 0: parts = [{"type": text_type, "text": str(content) or '[empty]'}]
         result.append({"role": role, "content": parts})
+        pending = []
         for tc in (msg.get("tool_calls") or []):
             f = tc.get("function", {})
-            result.append({"type": "function_call", "call_id": tc.get("id") or '', "name": f.get("name", ""), "arguments": f.get("arguments", "")})
+            cid = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+            pending.append(cid)
+            result.append({"type": "function_call", "call_id": cid, "name": f.get("name", ""), "arguments": f.get("arguments", "")})
     return result
 
 
@@ -644,11 +649,9 @@ class NativeClaudeSession(BaseSession):
 
 class NativeOAISession(NativeClaudeSession):
     def raw_ask(self, messages):
-        """OpenAI streaming. yields text chunks, generator return = list[content_block]"""
         messages = _fix_messages(messages)
-        msgs = ([{"role": "system", "content": self.system}] if self.system else []) + _msgs_claude2oai(messages)
-        return (yield from _openai_stream(self.api_base, self.api_key, msgs, self.model, self.api_mode,
-                                          temperature=self.temperature, max_tokens=self.max_tokens,
+        return (yield from _openai_stream(self.api_base, self.api_key, _msgs_claude2oai(messages), self.model, self.api_mode,
+                                          system=self.system, temperature=self.temperature, max_tokens=self.max_tokens,
                                           tools=self.tools, reasoning_effort=self.reasoning_effort,
                                           max_retries=self.max_retries, connect_timeout=self.connect_timeout,
                                           read_timeout=self.read_timeout, proxies=self.proxies, stream=self.stream))
@@ -912,19 +915,13 @@ class MixinSession:
 
 THINKING_PROMPT_ZH = """
 ### 行动规范（持续有效）
-每次回复请先在回复文字中包含：
-1. 在 <thinking></thinking> 标签中先分析现状和策略
-2. 在 <summary></summary> 中输出极简单行（<30字）物理快照：上次结果新信息+本次意图。此内容进入长期工作记忆。
-再进行回答。
-\n**除了最后回答，必须进行工具调用！**
+每次回复请先在回复文字中包含一个<summary></summary> 中输出极简单行（<30字）物理快照：上次结果新信息+本次意图。此内容进入长期工作记忆。
+\n**若用户需求未完成，必须进行工具调用！**
 """.strip()
 THINKING_PROMPT_EN = """
 ### Action Protocol (always in effect)
-The reply body should first include:
-1. Analyze the current situation and strategy inside <thinking></thinking>
-2. Output a minimal one-line (<30 words) physical snapshot in <summary></summary>: new info from last result + current intent. This goes into long-term working memory.
-Then reply.
-\n**Tool calls are required for every turn except the final answer!**
+The reply body should first include a minimal one-line (<30 words) physical snapshot in <summary></summary>: new info from last result + current intent. This goes into long-term working memory.
+\n**If the user's request is not yet complete, tool calls are required!**
 """.strip()
 
 class NativeToolClient:

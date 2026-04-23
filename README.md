@@ -79,7 +79,7 @@ git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
 
 # 2. Install minimal dependencies
-pip install streamlit pywebview
+pip install requests streamlit pywebview
 
 # 3. Configure API Key
 cp mykey_template.py mykey.py
@@ -283,7 +283,7 @@ git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
 
 # 2. 安装最小依赖
-pip install streamlit pywebview
+pip install requests streamlit pywebview
 
 # 3. 配置 API Key
 cp mykey_template.py mykey.py
