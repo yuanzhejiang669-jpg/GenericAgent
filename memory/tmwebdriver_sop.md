@@ -37,6 +37,7 @@ fetch('PDF_URL').then(r=>r.blob()).then(b=>{
 
 ## Chrome后台标签节流
 - 后台标签中`setTimeout`被Chrome intensive throttling延迟到≥1min/次，扩展脚本中避免依赖setTimeout轮询
+- 某些SPA页面需CDP `Page.bringToFront`切到前台才会加载数据
 
 ## CDP桥(tmwd_cdp_bridge扩展) ⭐首选
 扩展路径：`assets/tmwd_cdp_bridge/`(需安装，含debugger权限)
