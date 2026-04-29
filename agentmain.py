@@ -102,6 +102,7 @@ class GeneraticAgent:
         if not self.is_running: return
         print('Abort current task...')
         self.stop_sig = True
+        if self.task_dir: open(os.path.join(self.task_dir, '_stop'), 'w', encoding='utf-8').write('1')
         if self.handler is not None: self.handler.code_stop_signal.append(1)
             
     def put_task(self, query, source="user", images=None):
@@ -173,7 +174,276 @@ class GeneraticAgent:
                 self.task_queue.task_done()
                 if self.handler is not None: self.handler.code_stop_signal.append(1)
 
-    
+
+
+_bridge_session_locks = {}
+_bridge_session_locks_guard = threading.Lock()
+_bridge_token = os.environ.get('BROWSER_BRIDGE_TOKEN', '')
+
+
+def _bridge_json_response(handler, payload, status=200):
+    data = json.dumps(payload, ensure_ascii=False, default=str).encode('utf-8')
+    handler.send_response(status)
+    handler.send_header('Content-Type', 'application/json; charset=utf-8')
+    handler.send_header('Content-Length', str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def _bridge_read_json(handler):
+    length = int(handler.headers.get('Content-Length') or 0)
+    if length > 1024 * 1024: raise ValueError('request body too large')
+    if length <= 0: return {}
+    raw = handler.rfile.read(length).decode('utf-8', errors='replace')
+    return json.loads(raw) if raw.strip() else {}
+
+
+def _bridge_excerpt(text, limit=4000):
+    if not text: return ''
+    if len(text) <= limit: return text
+    half = max(1, limit // 2)
+    return text[:half] + '\n...[truncated]...\n' + text[-half:]
+
+
+def _bridge_safe_read(path):
+    try: return open(path, encoding='utf-8', errors='replace').read()
+    except Exception: return ''
+
+
+def _bridge_clean_session_id(session_id):
+    session_id = str(session_id or '').strip()
+    if session_id in {'.', '..'}: return None
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,120}', session_id): return None
+    return session_id
+
+
+def _bridge_task_dir(session_id):
+    temp_dir = os.path.realpath(os.path.join(script_dir, 'temp'))
+    task_dir = os.path.realpath(os.path.join(temp_dir, session_id))
+    if os.path.commonpath([temp_dir, task_dir]) != temp_dir: raise ValueError('invalid session path')
+    return task_dir
+
+
+def _bridge_output_files(task_dir):
+    def sort_key(path):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        suffix = stem.replace('output', '', 1)
+        if suffix == '': return (0, os.path.getmtime(path))
+        try: return (int(suffix), os.path.getmtime(path))
+        except ValueError: return (10**9, os.path.getmtime(path))
+    try: return sorted([os.path.join(task_dir, f) for f in os.listdir(task_dir) if re.fullmatch(r'output\d*\.txt', f)], key=sort_key)
+    except Exception: return []
+
+
+def _bridge_read_pid(task_dir):
+    try: return int(open(os.path.join(task_dir, 'browser_bridge.pid'), encoding='utf-8').read().strip())
+    except Exception: return None
+
+
+def _bridge_read_state(task_dir):
+    try: return json.loads(open(os.path.join(task_dir, 'browser_bridge.state.json'), encoding='utf-8').read())
+    except Exception: return {}
+
+
+def _bridge_write_state(task_dir, state):
+    open(os.path.join(task_dir, 'browser_bridge.state.json'), 'w', encoding='utf-8').write(json.dumps(state, ensure_ascii=False, indent=2) + '\n')
+
+
+def _bridge_process_alive(pid):
+    if pid is None: return False
+    try:
+        if os.name != 'nt':
+            os.kill(pid, 0)
+            return True
+        import subprocess
+        result = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/FO', 'CSV', '/NH'], capture_output=True, text=True, encoding='utf-8', errors='replace', check=False)
+        return any(row.split(',')[1].strip('"') == str(pid) for row in (result.stdout or '').splitlines() if row.strip() and not row.startswith('INFO:'))
+    except Exception:
+        return False
+
+
+def _bridge_interrupt(task_dir):
+    path = os.path.join(task_dir, 'interrupt.json')
+    try:
+        payload = json.loads(open(path, encoding='utf-8').read())
+    except Exception:
+        return None
+    if not isinstance(payload, dict): return None
+    data = payload.get('data') if isinstance(payload.get('data'), dict) else payload
+    question = data.get('question')
+    if not isinstance(question, str) or not question.strip(): return None
+    candidates = data.get('candidates') if isinstance(data.get('candidates'), list) else []
+    return {
+        'status': payload.get('status', 'INTERRUPT'),
+        'intent': payload.get('intent', 'HUMAN_INTERVENTION'),
+        'question': question,
+        'candidates': [str(x) for x in candidates],
+    }
+
+
+def _bridge_session_status(session_id):
+    clean_id = _bridge_clean_session_id(session_id)
+    if not clean_id:
+        return {'task_id': session_id, 'status': 'invalid_task_id', 'exists': False, 'has_output': False}
+    task_dir = _bridge_task_dir(clean_id)
+    exists = os.path.isdir(task_dir)
+    pid = _bridge_read_pid(task_dir) if exists else None
+    process_alive = _bridge_process_alive(pid)
+    output_files = _bridge_output_files(task_dir) if exists else []
+    latest_output_path = output_files[-1] if output_files else None
+    latest_output = _bridge_safe_read(latest_output_path) if latest_output_path else ''
+    stdout_log_path = os.path.join(task_dir, 'stdout.log') if exists else None
+    stderr_log_path = os.path.join(task_dir, 'stderr.log') if exists else None
+    stdout_text = _bridge_safe_read(stdout_log_path) if stdout_log_path else ''
+    stderr_text = _bridge_safe_read(stderr_log_path) if stderr_log_path else ''
+    reply_path = os.path.join(task_dir, 'reply.txt') if exists else None
+    interrupt_path = os.path.join(task_dir, 'interrupt.json') if exists else None
+    interrupt_info = _bridge_interrupt(task_dir) if exists else None
+    state = _bridge_read_state(task_dir) if exists else {}
+    expected_output_file_count = state.get('reply_expected_output_file_count')
+    waiting_for_reply = bool(process_alive and output_files and '[ROUND END]' in latest_output and not os.path.exists(reply_path) and not (isinstance(expected_output_file_count, int) and len(output_files) < expected_output_file_count))
+    if not exists: status = 'missing'
+    elif waiting_for_reply or interrupt_info: status = 'waiting_for_reply'
+    elif process_alive: status = 'running'
+    elif output_files and '[ROUND END]' in latest_output: status = 'completed'
+    elif output_files: status = 'completed'
+    else: status = 'failed' if stderr_text else 'empty'
+    return {
+        'task_id': clean_id,
+        'task_dir': task_dir,
+        'exists': exists,
+        'status': status,
+        'latest_output_path': latest_output_path,
+        'latest_output_excerpt': _bridge_excerpt(latest_output),
+        'stdout_log_path': stdout_log_path if stdout_log_path and os.path.exists(stdout_log_path) else None,
+        'stdout_excerpt': _bridge_excerpt(stdout_text),
+        'stderr_log_path': stderr_log_path if stderr_log_path and os.path.exists(stderr_log_path) else None,
+        'stderr_excerpt': _bridge_excerpt(stderr_text),
+        'output_file_count': len(output_files),
+        'waiting_for_reply': status == 'waiting_for_reply',
+        'reply_file_exists': bool(reply_path and os.path.exists(reply_path)),
+        'reply_in_flight': bool(reply_path and os.path.exists(reply_path) and process_alive),
+        'reply_expected_output_file_count': state.get('reply_expected_output_file_count'),
+        'interrupt_pending': bool(interrupt_info),
+        'interrupt_kind': interrupt_info.get('status') if interrupt_info else None,
+        'interrupt_intent': interrupt_info.get('intent') if interrupt_info else None,
+        'question': interrupt_info.get('question') if interrupt_info else None,
+        'candidates': interrupt_info.get('candidates') if interrupt_info else [],
+        'interrupt_path': interrupt_path if interrupt_path and os.path.exists(interrupt_path) else None,
+        'pid_file_path': os.path.join(task_dir, 'browser_bridge.pid') if exists else None,
+        'pid': pid,
+        'process_alive': process_alive,
+        'timed_out': False,
+        'has_output': bool(output_files),
+    }
+
+
+def _bridge_prepare_task_dir(task_dir):
+    os.makedirs(task_dir, exist_ok=True)
+    for name in ('input.txt', 'reply.txt', '_stop', 'stdout.log', 'stderr.log', 'browser_bridge.pid', 'browser_bridge.state.json', 'interrupt.json'):
+        path = os.path.join(task_dir, name)
+        if os.path.exists(path): os.remove(path)
+    for name in os.listdir(task_dir):
+        if re.fullmatch(r'output\d*\.txt', name): os.remove(os.path.join(task_dir, name))
+
+
+def _bridge_launch_session(payload):
+    import subprocess, platform
+    session_id = _bridge_clean_session_id(payload.get('session_id'))
+    prompt = str(payload.get('prompt') or '').strip()
+    if not session_id: return {'status': 'invalid_task_id', 'accepted': False}, 400
+    if not prompt: return {'status': 'invalid_prompt', 'accepted': False}, 400
+    try: llm_no = int(payload.get('llm_no') or 0)
+    except (TypeError, ValueError): return {'status': 'invalid_llm_no', 'accepted': False}, 400
+    with _bridge_session_locks_guard:
+        lock = _bridge_session_locks.setdefault(session_id, threading.Lock())
+    with lock:
+        task_dir = _bridge_task_dir(session_id)
+        current = _bridge_session_status(session_id)
+        if current.get('process_alive'):
+            current.update({'status': 'task_conflict', 'accepted': False, 'conflict_reason': f'task {session_id} is already active'})
+            return current, 409
+        _bridge_prepare_task_dir(task_dir)
+        open(os.path.join(task_dir, 'input.txt'), 'w', encoding='utf-8').write(prompt)
+        stdout_path = os.path.join(task_dir, 'stdout.log')
+        stderr_path = os.path.join(task_dir, 'stderr.log')
+        cmd = [sys.executable, os.path.abspath(__file__), '--task', session_id, '--llm_no', str(llm_no)]
+        stdout_handle = open(stdout_path, 'w', encoding='utf-8')
+        stderr_handle = open(stderr_path, 'w', encoding='utf-8')
+        try:
+            env = os.environ.copy()
+            env.pop('BROWSER_BRIDGE_TOKEN', None)
+            proc = subprocess.Popen(cmd, cwd=script_dir,
+                creationflags=0x08000000 if platform.system() == 'Windows' else 0,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                env=env)
+        finally:
+            stdout_handle.close()
+            stderr_handle.close()
+        open(os.path.join(task_dir, 'browser_bridge.pid'), 'w', encoding='utf-8').write(str(proc.pid))
+        status = _bridge_session_status(session_id)
+        status.update({'status': 'queued' if status['status'] in {'empty', 'running'} else status['status'], 'accepted': True})
+        return status, 200
+
+
+def serve_bridge(host, port):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import unquote, urlparse
+    if host not in {'127.0.0.1', 'localhost', '::1'}:
+        raise ValueError('bridge host must be loopback')
+
+    class BridgeHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args): return
+
+        def _path(self): return urlparse(self.path).path
+
+        def do_GET(self):
+            path = self._path()
+            if path == '/bridge/health':
+                return _bridge_json_response(self, {'status': 'ok', 'pid': os.getpid(), 'project_dir': script_dir})
+            if path == '/bridge/capabilities':
+                return _bridge_json_response(self, {'status': 'ok', 'tools': [t.get('function', {}).get('name') for t in TOOLS_SCHEMA], 'endpoints': ['/bridge/health', '/bridge/capabilities', '/bridge/sessions']})
+            if path == '/bridge/sessions':
+                return _bridge_json_response(self, {'status': 'ok', 'sessions': []})
+            m = re.fullmatch(r'/bridge/sessions/([^/]+)', path)
+            if m: return _bridge_json_response(self, _bridge_session_status(unquote(m.group(1))))
+            return _bridge_json_response(self, {'status': 'missing', 'path': path}, 404)
+
+        def do_POST(self):
+            path = self._path()
+            if not _bridge_token or self.headers.get('X-Bridge-Token') != _bridge_token:
+                return _bridge_json_response(self, {'status': 'unauthorized'}, 403)
+            try: payload = _bridge_read_json(self)
+            except ValueError as exc: return _bridge_json_response(self, {'status': 'invalid_request', 'error': str(exc)}, 413)
+            except Exception as exc: return _bridge_json_response(self, {'status': 'invalid_json', 'error': str(exc)}, 400)
+            if path == '/bridge/capabilities/refresh':
+                return _bridge_json_response(self, {'status': 'ok', 'tools': [t.get('function', {}).get('name') for t in TOOLS_SCHEMA], 'refreshed': True})
+            if path == '/bridge/sessions':
+                result, status = _bridge_launch_session(payload)
+                return _bridge_json_response(self, result, status)
+            m = re.fullmatch(r'/bridge/sessions/([^/]+)/(reply|stop)', path)
+            if not m: return _bridge_json_response(self, {'status': 'missing', 'path': path}, 404)
+            session_id, action = unquote(m.group(1)), m.group(2)
+            clean_id = _bridge_clean_session_id(session_id)
+            if not clean_id: return _bridge_json_response(self, {'status': 'invalid_task_id'}, 400)
+            task_dir = _bridge_task_dir(clean_id)
+            if action == 'reply':
+                reply = str(payload.get('reply') or '').strip()
+                if not reply: return _bridge_json_response(self, {'status': 'invalid_reply', 'accepted': False}, 400)
+                os.makedirs(task_dir, exist_ok=True)
+                _bridge_write_state(task_dir, {'reply_expected_output_file_count': len(_bridge_output_files(task_dir)) + 1})
+                open(os.path.join(task_dir, 'reply.txt'), 'w', encoding='utf-8').write(reply)
+                return _bridge_json_response(self, {'status': 'accepted', 'accepted': True, 'reply_accepted': True, 'reply_written': True})
+            os.makedirs(task_dir, exist_ok=True)
+            open(os.path.join(task_dir, '_stop'), 'w', encoding='utf-8').write('1')
+            return _bridge_json_response(self, {'status': 'accepted', 'stop_requested': True, 'stop_file_written': True})
+
+    server = ThreadingHTTPServer((host, port), BridgeHandler)
+    print(f'[Bridge] listening on http://{host}:{port}', flush=True)
+    server.serve_forever()
+
+
 if __name__ == '__main__':
     import argparse
     from datetime import datetime
@@ -184,7 +454,14 @@ if __name__ == '__main__':
     parser.add_argument('--llm_no', type=int, default=0)
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--bg', action='store_true', help='popen, print PID, exit')
+    parser.add_argument('--serve-bridge', action='store_true', help='run browser bridge HTTP service')
+    parser.add_argument('--bridge-host', default='127.0.0.1')
+    parser.add_argument('--bridge-port', type=int, default=18561)
     args = parser.parse_args()
+
+    if args.serve_bridge:
+        serve_bridge(args.bridge_host, args.bridge_port)
+        sys.exit(0)
 
     if args.bg:
         import subprocess, platform
@@ -215,11 +492,15 @@ if __name__ == '__main__':
                 if 'next' in item and random.random() < 0.95:  # 概率写一次中间结果
                     with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item.get('next', ''))
             with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item['done'] + '\n\n[ROUND END]\n')
-            consume_file(d, '_stop')  # 已经成功停下来了，避免打断下次reply
+            if consume_file(d, '_stop'): break
             for _ in range(300):  # 等reply.txt，10分钟超时
                 time.sleep(2)
+                if consume_file(d, '_stop'):
+                    raw = ''
+                    break
                 if (raw := consume_file(d, 'reply.txt')): break
             else: break
+            if not raw: break
             nround = nround + 1 if isinstance(nround, int) else 1
     elif args.reflect:
         import importlib.util
